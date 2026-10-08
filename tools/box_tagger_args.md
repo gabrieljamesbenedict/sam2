@@ -77,7 +77,22 @@ Frame index to draw box(es) on (refers to extracted sequence index).
 ```python
 --box X1 Y1 X2 Y2  # float x4, action=append
 ```
-Box in original video pixels, `xyxy`. Repeat flag per object. Omit for GUI `cv2.selectROI` (`ENTER`=keep, `ESC`=done).
+Box in original video pixels, `xyxy`. Repeat flag per object. Omit for GUI `cv2.selectROI` (`ENTER`=keep, `ESC`=done). Order matches `--cls-id` order.
+
+```python
+--cls-id INT  # action=append, default [0]
+```
+Class id per `--box`, in order. Repeat per box; a single value broadcasts to all. Example: `--box A --box B --cls-id 0 --cls-id 2`.
+
+```python
+--classes STR  # default "person", e.g. "person,car,dog"
+```
+Comma-separated names for `data.yaml`. Must satisfy `max(cls-id) < len(classes)`.
+
+```python
+--gui-class-order INT...  # default None, e.g. --gui-class-order 0 0 2
+```
+Pre-declared class per drawn GUI box in order (no prompts). Omit for terminal prompt `kept box N [0=person 1=car] -> class [0]:`.
 
 ```python
 --no-interactive  # store_true
@@ -106,11 +121,9 @@ Propagate forward + backward from `--ann-frame`. Use for middle-frame annotation
 ```python
 --output-dir DIR  # required
 ```
-Writes `labels/<frame>.txt` + `data.yaml`.
+Writes `labels/<frame>.txt` (per-line class) + `data.yaml`.
 
 ```python
---cls-id INT  # default 0, single class id for all boxes
---classes STR  # default "person", comma-separated names for data.yaml
 --save-images  # store_true, also copy frames to <output-dir>/images/
 ```
 

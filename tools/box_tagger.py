@@ -125,11 +125,18 @@ def parse_args():
     p.add_argument("--box", type=float, nargs=4, action="append",
                    metavar=("X1", "Y1", "X2", "Y2"),
                    help="box in ORIGINAL video pixels (xyxy). "
-                        "Repeat for multiple objects. Omit for GUI select.")
-    p.add_argument("--cls-id", type=int, default=0,
-                   help="YOLO class id for ALL boxes (default 0)")
+                        "Repeat for multiple objects. Omit for GUI select. "
+                        "Order matches --cls-id order.")
+    p.add_argument("--cls-id", type=int, action="append", default=None,
+                   help="YOLO class id per --box, in order. Repeat per box; "
+                        "a single value broadcasts to all boxes "
+                        "(default 0). GUI: used as default prompt.")
     p.add_argument("--classes", type=str, default="person",
                    help="comma-separated class names for data.yaml")
+    p.add_argument("--gui-class-order", type=int, nargs="*", default=None,
+                   help="pre-declared class per drawn GUI box in order "
+                        "(avoids per-box prompts). "
+                        "Example: --gui-class-order 0 0 2.")
     p.add_argument("--bidirectional", action="store_true",
                    help="also propagate backwards from --ann-frame "
                         "(use when annotating a middle frame, e.g. HOI)")
@@ -262,13 +269,14 @@ def split_into_chunks(num_frames, chunk_size, overlap):
 
 
 def yolo_lines_to_pixel_boxes(lines, video_w, video_h):
-    """Invert pixel_boxes_to_yolo_lines for --resume reprompting."""
-    boxes = []
+    """Invert pixel_boxes_to_yolo_lines; returns (boxes, clss) for resume."""
+    boxes, clss = [], []
     for ln in lines:
         parts = ln.strip().split()
         if len(parts) != 5:
             continue
-        _, cx, cy, bw, bh = parts
+        cls, cx, cy, bw, bh = parts
+        cls = int(float(cls))
         cx, cy, bw, bh = float(cx), float(cy), float(bw), float(bh)
         w_px = bw * video_w
         h_px = bh * video_h
@@ -277,7 +285,13 @@ def yolo_lines_to_pixel_boxes(lines, video_w, video_h):
         x2 = x1 + w_px - 1.0
         y2 = y1 + h_px - 1.0
         boxes.append([x1, y1, x2, y2])
-    return boxes
+        clss.append(cls)
+    return boxes, clss
+
+
+def yolo_lines_to_boxes_with_cls(lines, video_w, video_h):
+    boxes, clss = yolo_lines_to_pixel_boxes(lines, video_w, video_h)
+    return list(zip(boxes, clss))
 
 
 def find_jpeg_ext(frame_dir, basename):
@@ -311,6 +325,42 @@ def get_reprompt_boxes(boxes_by_frame, search_from, search_to_excl,
     return fallback_boxes
 
 
+def resolve_box_classes(num_boxes, cls_ids, class_names, default_cls=0):
+    """Map --cls-id list to per-box classes (single value broadcasts)."""
+    if cls_ids is None or len(cls_ids) == 0:
+        clss = [default_cls] * num_boxes
+    elif len(cls_ids) == 1:
+        clss = list(cls_ids) * num_boxes
+    elif len(cls_ids) == num_boxes:
+        clss = list(cls_ids)
+    else:
+        raise ValueError(f"--cls-id count {len(cls_ids)} must be 1 or match "
+                         f"--box count {num_boxes}")
+    nc = len(class_names)
+    for c in clss:
+        if not 0 <= c < nc:
+            raise ValueError(f"class id {c} out of range for "
+                             f"--classes {class_names} (nc={nc})")
+    return clss
+
+
+def prompt_class_for_box(idx, class_names, default_cls):
+    listing = " ".join(f"{i}={n}" for i, n in enumerate(class_names))
+    while True:
+        raw = input(f"kept box {idx} [{listing}] -> class "
+                    f"[{default_cls}] (Enter=default): ").strip()
+        if raw == "":
+            return default_cls
+        try:
+            c = int(raw)
+        except ValueError:
+            print(f"invalid '{raw}'; enter 0..{len(class_names)-1}")
+            continue
+        if 0 <= c < len(class_names):
+            return c
+        print(f"out of range; enter 0..{len(class_names)-1}")
+
+
 def read_display_frame(video_path, frame_idx):
     """Read one frame at ORIGINAL resolution as BGR (for box drawing)."""
     if is_jpeg_dir(video_path):
@@ -335,8 +385,11 @@ def read_display_frame(video_path, frame_idx):
     return img
 
 
-def select_boxes_gui(video_path, frame_idx):
+def select_boxes_gui(video_path, frame_idx, class_names=None,
+                     default_cls=0, gui_class_order=None):
+    """Draw boxes, return [(xyxy, cls)] using prompts or pre-declared order."""
     img = read_display_frame(video_path, frame_idx)
+    class_names = class_names or ["object"]
     boxes = []
     win = "box_tagger: drag box, ENTER=keep, ESC=done"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -345,9 +398,26 @@ def select_boxes_gui(video_path, frame_idx):
         x, y, w, h = cv2.selectROI(win, img, showCrosshair=True)
         if w <= 0 or h <= 0:
             break
-        boxes.append([float(x), float(y), float(x + w), float(y + h)])
-        print(f"kept box {len(boxes)}: {[x, y, x + w, y + h]} "
-              f"(draw another, or ESC to finish)")
+        box = [float(x), float(y), float(x + w), float(y + h)]
+        idx = len(boxes) + 1
+        if gui_class_order is not None:
+            if idx - 1 >= len(gui_class_order):
+                cv2.destroyWindow(win)
+                raise ValueError(
+                    f"--gui-class-order has {len(gui_class_order)} entries "
+                    f"but drew box {idx}")
+            cls = int(gui_class_order[idx - 1])
+            if not 0 <= cls < len(class_names):
+                cv2.destroyWindow(win)
+                raise ValueError(f"gui class {cls} out of range")
+        else:
+            # Prompt in terminal (window stays open for next draw).
+            listing = " ".join(f"{i}={n}"
+                               for i, n in enumerate(class_names))
+            print(f"kept box {idx}: {[x, y, x + w, y + h]} "
+                  f"(draw another, or ESC to finish)")
+            cls = prompt_class_for_box(idx, class_names, default_cls)
+        boxes.append((box, cls))
     cv2.destroyWindow(win)
     if not boxes:
         raise RuntimeError("no boxes drawn; pass --box x1 y1 x2 y2 or draw one")
@@ -389,10 +459,44 @@ def masks_to_pixel_boxes(masks, score_thresh, min_area):
     return boxes
 
 
-def pixel_boxes_to_yolo_lines(pixel_boxes, cls_id, video_w, video_h):
+def masks_to_boxes_with_cls(masks, obj_ids, obj_id_to_cls, score_thresh,
+                            min_area):
+    """Convert batch masks to [(xyxy, cls)] preserving obj-id mapping."""
+    if masks is None:
+        return []
+    if torch.is_tensor(masks):
+        logits = masks.detach().cpu()
+    else:
+        logits = torch.as_tensor(np.asarray(masks))
+    if logits.numel() == 0:
+        return []
+    out = []
+    for i, oid in enumerate(list(obj_ids)):
+        m = (logits[i:i + 1] > score_thresh)
+        if int(m.sum().item()) < min_area:
+            continue
+        xyxy = mask_to_box(m).reshape(-1).tolist()
+        out.append(([float(v) for v in xyxy], int(obj_id_to_cls[int(oid)])))
+    return out
+
+
+def split_boxes_and_clss(boxes_with_cls):
+    """Split [(xyxy, cls)] into (boxes, clss) for YOLO/preview/reprompt."""
+    boxes = [b for b, _ in boxes_with_cls]
+    clss = [int(c) for _, c in boxes_with_cls]
+    return boxes, clss
+
+
+def pixel_boxes_to_yolo_lines(pixel_boxes, box_clss, video_w, video_h):
     """Convert pixel xyxy (inclusive) boxes to YOLO normalized lines."""
+    if isinstance(box_clss, int):
+        clss = [box_clss] * len(pixel_boxes)
+    else:
+        clss = list(box_clss)
+        if len(clss) != len(pixel_boxes):
+            raise ValueError("boxes/clss length mismatch")
     lines = []
-    for x1, y1, x2, y2 in pixel_boxes:
+    for (x1, y1, x2, y2), cls in zip(pixel_boxes, clss):
         # mask_to_box uses inclusive max index; +1 converts to pixel extent
         cx = ((x1 + x2 + 1.0) / 2.0) / video_w
         cy = ((y1 + y2 + 1.0) / 2.0) / video_h
@@ -404,7 +508,7 @@ def pixel_boxes_to_yolo_lines(pixel_boxes, cls_id, video_w, video_h):
         bh = min(max(bh, 0.0), 1.0)
         if bw <= 0 or bh <= 0:
             continue
-        lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+        lines.append(f"{int(cls)} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
     return lines
 
 
@@ -428,11 +532,13 @@ PALETTE = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (0, 255, 255),
 
 
 def render_preview_stream(frame_dir, basenames, boxes_by_frame, video_w,
-                          video_h, fps, show_live, save_path):
+                          video_h, fps, show_live, save_path,
+                          class_names=None):
     """Stream annotated frames: live cv2.imshow and/or saved mp4.
 
-    Reads one JPEG at a time (O(1) RAM), draws pixel xyxy boxes, shows
-    and/or writes. Press q/ESC in the live window to stop early.
+    boxes_by_frame values are [(xyxy, cls)] (multi-class) or legacy [xyxy].
+    Color is per-class; label shows class name when available.
+    Reads one JPEG at a time (O(1) RAM). Press q/ESC to stop early.
     """
     writer = None
     if save_path:
@@ -465,11 +571,22 @@ def render_preview_stream(frame_dir, basenames, boxes_by_frame, video_w,
                 continue
             if img.shape[1] != video_w or img.shape[0] != video_h:
                 img = cv2.resize(img, (video_w, video_h))
-            for oi, (x1, y1, x2, y2) in enumerate(boxes_by_frame.get(f, [])):
-                color = PALETTE[oi % len(PALETTE)]
+            for oi, item in enumerate(boxes_by_frame.get(f, [])):
+                if (isinstance(item, (list, tuple)) and len(item) == 2
+                        and isinstance(item[0], (list, tuple))):
+                    (x1, y1, x2, y2), cls = item
+                    cls = int(cls)
+                else:
+                    x1, y1, x2, y2 = item
+                    cls = 0
+                color = PALETTE[cls % len(PALETTE)]
                 cv2.rectangle(img, (int(round(x1)), int(round(y1))),
                               (int(round(x2)), int(round(y2))), color, 2)
-                cv2.putText(img, f"obj{oi + 1}", (int(round(x1)),
+                if class_names and 0 <= cls < len(class_names):
+                    tag = f"{class_names[cls]} {oi + 1}"
+                else:
+                    tag = f"cls{cls} obj{oi + 1}"
+                cv2.putText(img, tag, (int(round(x1)),
                               max(0, int(round(y1)) - 5)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             if writer is not None:
@@ -517,19 +634,32 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
     video_h, video_w = probe.shape[:2]
 
     os.makedirs(label_dir, exist_ok=True)
+    class_names = [c.strip() for c in args.classes.split(",") if c.strip()]
+    if not class_names:
+        raise ValueError("--classes must list at least one name")
+    default_cls = (args.cls_id[0] if args.cls_id else 0)
     if args.box:
-        init_boxes = [clamp_box_xyxy(b, video_w, video_h)
-                      for b in args.box]
+        raw_boxes = [clamp_box_xyxy(b, video_w, video_h)
+                     for b in args.box]
+        clss = resolve_box_classes(len(raw_boxes), args.cls_id,
+                                   class_names, default_cls)
+        init_boxes_with_cls = list(zip(raw_boxes, clss))
     elif args.no_interactive:
         raise ValueError("no --box given with --no-interactive")
     else:
         print(f"draw box(es) on frame {args.ann_frame} "
               f"(ENTER keeps, ESC finishes)")
-        init_boxes = [clamp_box_xyxy(b, video_w, video_h)
-                      for b in select_boxes_gui(full_frame_dir,
-                                               args.ann_frame)]
-    print(f"tracking {len(init_boxes)} object(s) from frame {args.ann_frame}")
-    if not init_boxes:
+        drawn = select_boxes_gui(full_frame_dir, args.ann_frame,
+                                 class_names, default_cls,
+                                 args.gui_class_order)
+        init_boxes_with_cls = [
+            (clamp_box_xyxy(b, video_w, video_h), int(c)) for b, c in drawn]
+        for _, c in init_boxes_with_cls:
+            if not 0 <= c < len(class_names):
+                raise ValueError(f"class id {c} out of range")
+    print(f"tracking {len(init_boxes_with_cls)} object(s) from frame "
+          f"{args.ann_frame}")
+    if not init_boxes_with_cls:
         raise RuntimeError("no boxes to track")
 
     boxes_by_frame = {}
@@ -552,7 +682,7 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
                             label_dir, full_basenames[g] + ".txt")) as fh:
                         lines = [ln for ln in fh.read().splitlines()
                                  if ln.strip()]
-                    boxes_by_frame[g] = yolo_lines_to_pixel_boxes(
+                    boxes_by_frame[g] = yolo_lines_to_boxes_with_cls(
                         lines, video_w, video_h)
                 print(f"chunk {ki+1}/{len(chunks)} [{s}:{e}] resumed "
                       f"(kept {keep_start}:{e})")
@@ -573,17 +703,20 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
                   f"{inference_state['video_height']} != "
                   f"probe {video_w}x{video_h}; using probe for YOLO")
         if ki == 0:
-            prompt_boxes = init_boxes
+            prompt_with_cls = init_boxes_with_cls
             ann_local = args.ann_frame - s
         else:
-            prompt_boxes = get_reprompt_boxes(
+            prompt_with_cls = get_reprompt_boxes(
                 boxes_by_frame, s, s + args.chunk_overlap or s + 1,
-                init_boxes)
-            if not prompt_boxes:
+                init_boxes_with_cls)
+            if not prompt_with_cls:
                 print(f"WARNING: chunk {ki} has no reprompt boxes; "
                       f"reusing initial boxes (may re-acquire)")
-                prompt_boxes = init_boxes
+                prompt_with_cls = init_boxes_with_cls
             ann_local = 0
+        prompt_boxes, _ = split_boxes_and_clss(prompt_with_cls)
+        obj_id_to_cls = {i + 1: int(c)
+                         for i, (_, c) in enumerate(prompt_with_cls)}
         print(f"chunk {ki+1}/{len(chunks)} [{s}:{e}] "
               f"prompt {len(prompt_boxes)} box(es) at local {ann_local} "
               f"(global {s + ann_local}) ...")
@@ -595,7 +728,7 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
                     obj_id=obj_idx + 1,
                     box=np.array(box, dtype=np.float32),
                 )
-            for f_local, _ids, m in predictor.propagate_in_video(
+            for f_local, obj_ids, m in predictor.propagate_in_video(
                 inference_state, start_frame_idx=int(ann_local),
                 reverse=False,
             ):
@@ -603,12 +736,14 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
                 if g < keep_start or g >= e:
                     continue  # drop overlap dup / out-of-chunk
                 if g not in boxes_by_frame:
-                    boxes_by_frame[g] = masks_to_pixel_boxes(
-                        m.cpu(), args.score_thresh, args.min_area)
+                    boxes_by_frame[g] = masks_to_boxes_with_cls(
+                        m.cpu(), obj_ids, obj_id_to_cls,
+                        args.score_thresh, args.min_area)
         # Write kept labels immediately (crash-resume friendly).
         for g in range(keep_start, e):
-            lines = pixel_boxes_to_yolo_lines(boxes_by_frame.get(g, []),
-                                              args.cls_id, video_w, video_h)
+            boxes, clss = split_boxes_and_clss(
+                boxes_by_frame.get(g, []))
+            lines = pixel_boxes_to_yolo_lines(boxes, clss, video_w, video_h)
             with open(os.path.join(label_dir,
                                     full_basenames[g] + ".txt"), "w") as fh:
                 fh.write("\n".join(lines))
@@ -718,11 +853,14 @@ def main():
             print(f"saved {ok_count} frames to {img_dir}")
 
         if args.preview or args.preview_video:
+            class_names = [c.strip() for c in args.classes.split(",")
+                           if c.strip()]
             render_preview_stream(full_frame_dir, basenames[:num_frames],
                                   boxes_by_frame, video_w, video_h,
                                   float(preview_fps if preview_fps else 30.0),
                                   show_live=bool(args.preview),
-                                  save_path=args.preview_video)
+                                  save_path=args.preview_video,
+                                  class_names=class_names)
         print("done")
         return
 
@@ -741,20 +879,33 @@ def main():
         raise ValueError(f"--ann-frame {args.ann_frame} out of range "
                          f"(0..{num_frames-1})")
 
+    names = [c.strip() for c in args.classes.split(",") if c.strip()]
+    if not names:
+        raise ValueError("--classes must list at least one name")
+    default_cls = (args.cls_id[0] if args.cls_id else 0)
     if args.box:
-        boxes = [clamp_box_xyxy(b, video_w, video_h) for b in args.box]
+        raw_boxes = [clamp_box_xyxy(b, video_w, video_h)
+                     for b in args.box]
+        clss = resolve_box_classes(len(raw_boxes), args.cls_id, names,
+                                   default_cls)
+        boxes_with_cls = list(zip(raw_boxes, clss))
     elif args.no_interactive:
         raise ValueError("no --box given with --no-interactive")
     else:
         print(f"draw box(es) on frame {args.ann_frame} "
               f"(ENTER keeps, ESC finishes)")
-        boxes = [clamp_box_xyxy(b, video_w, video_h)
-                 for b in select_boxes_gui(sam2_path, args.ann_frame)]
-    print(f"tracking {len(boxes)} object(s) from frame {args.ann_frame}")
+        drawn = select_boxes_gui(sam2_path, args.ann_frame, names,
+                                 default_cls, args.gui_class_order)
+        boxes_with_cls = [(clamp_box_xyxy(b, video_w, video_h), int(c))
+                          for b, c in drawn]
+    print(f"tracking {len(boxes_with_cls)} object(s) from frame "
+          f"{args.ann_frame}")
+    boxes, _ = split_boxes_and_clss(boxes_with_cls)
+    obj_id_to_cls = {i + 1: int(c) for i, (_, c) in enumerate(boxes_with_cls)}
 
     autocast = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                 if device == "cuda" else torch.cpu.amp.autocast(enabled=False))
-    # Streaming: convert each mask to tiny pixel boxes immediately and
+    # Streaming: convert each mask to tiny (box, cls) immediately and
     # discard the full logits, so memory stays O(frames x boxes).
     boxes_by_frame = {}
     with autocast:
@@ -774,12 +925,13 @@ def main():
         for start, reverse in passes:
             direction = "backward" if reverse else "forward"
             print(f"propagating {direction} from frame {start} ...")
-            for f, _ids, m in predictor.propagate_in_video(
+            for f, obj_ids, m in predictor.propagate_in_video(
                 inference_state, start_frame_idx=start, reverse=reverse
             ):
                 if f not in boxes_by_frame:
-                    boxes_by_frame[f] = masks_to_pixel_boxes(
-                        m.cpu(), args.score_thresh, args.min_area)
+                    boxes_by_frame[f] = masks_to_boxes_with_cls(
+                        m.cpu(), obj_ids, obj_id_to_cls,
+                        args.score_thresh, args.min_area)
 
     if len(boxes_by_frame) != num_frames:
         missing = sorted(set(range(num_frames)) - set(boxes_by_frame))
@@ -800,8 +952,8 @@ def main():
     os.makedirs(label_dir, exist_ok=True)
     n_pos = 0
     for f in range(num_frames):
-        lines = pixel_boxes_to_yolo_lines(boxes_by_frame.get(f, []),
-                                          args.cls_id, video_w, video_h)
+        boxes_f, clss_f = split_boxes_and_clss(boxes_by_frame.get(f, []))
+        lines = pixel_boxes_to_yolo_lines(boxes_f, clss_f, video_w, video_h)
         n_pos += 1 if lines else 0
         with open(os.path.join(label_dir, basenames[f] + ".txt"), "w") as fh:
             fh.write("\n".join(lines))
@@ -835,7 +987,8 @@ def main():
                               boxes_by_frame, video_w, video_h,
                               float(preview_fps),
                               show_live=bool(args.preview),
-                              save_path=args.preview_video)
+                              save_path=args.preview_video,
+                              class_names=names)
 
     print("done")
 
