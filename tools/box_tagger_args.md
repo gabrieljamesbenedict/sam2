@@ -95,6 +95,11 @@ Comma-separated names for `data.yaml`. Must satisfy `max(cls-id) < len(classes)`
 Pre-declared class per drawn GUI box in order (no prompts). Omit for terminal prompt `kept box N [0=person 1=car] -> class [0]:`.
 
 ```python
+--init-boxes-file PATH  # default None, e.g. outputs/x/init_boxes.json
+```
+Load initial `(box, cls)` prompts from JSON instead of GUI/`--box`. Saved automatically to `<output-dir>/init_boxes.json` on every run for future automation. File `ann_frame` overrides CLI.
+
+```python
 --no-interactive  # store_true
 ```
 Fail if `--box` is missing instead of opening GUI.

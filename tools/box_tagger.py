@@ -137,6 +137,11 @@ def parse_args():
                    help="pre-declared class per drawn GUI box in order "
                         "(avoids per-box prompts). "
                         "Example: --gui-class-order 0 0 2.")
+    p.add_argument("--init-boxes-file", type=str, default=None,
+                   help="load initial (box, cls) prompts from JSON instead "
+                        "of GUI/--box. Saved automatically to "
+                        "<output-dir>/init_boxes.json on every run for "
+                        "future automation.")
     p.add_argument("--bidirectional", action="store_true",
                    help="also propagate backwards from --ann-frame "
                         "(use when annotating a middle frame, e.g. HOI)")
@@ -359,6 +364,48 @@ def prompt_class_for_box(idx, class_names, default_cls):
         if 0 <= c < len(class_names):
             return c
         print(f"out of range; enter 0..{len(class_names)-1}")
+
+
+def save_init_boxes(path, ann_frame, boxes_with_cls, class_names):
+    """Persist initial prompts for future automation (always overwritten)."""
+    import json
+    payload = {
+        "ann_frame": int(ann_frame),
+        "classes": list(class_names),
+        "boxes": [{"xyxy": [float(v) for v in b], "cls": int(c)}
+                  for b, c in boxes_with_cls],
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"saved {len(boxes_with_cls)} init box(es) to {path}")
+
+
+def load_init_boxes(path, class_names):
+    """Load [(xyxy, cls)] + ann_frame; validates cls against class_names."""
+    import json
+    with open(path) as fh:
+        payload = json.load(fh)
+    ann_frame = int(payload.get("ann_frame", 0))
+    items = payload.get("boxes", [])
+    if not items:
+        raise ValueError(f"no boxes in {path}")
+    file_classes = payload.get("classes")
+    if file_classes and list(file_classes) != list(class_names):
+        print(f"WARNING: {path} classes {file_classes} != "
+              f"--classes {class_names}; validating ids only")
+    out = []
+    for it in items:
+        b = [float(v) for v in it["xyxy"]]
+        c = int(it["cls"])
+        if not 0 <= c < len(class_names):
+            raise ValueError(f"class id {c} in {path} out of range")
+        if len(b) != 4:
+            raise ValueError(f"bad xyxy {b} in {path}")
+        out.append((b, c))
+    print(f"loaded {len(out)} init box(es) from {path} "
+          f"(ann_frame {ann_frame})")
+    return ann_frame, out
 
 
 def read_display_frame(video_path, frame_idx):
@@ -638,7 +685,16 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
     if not class_names:
         raise ValueError("--classes must list at least one name")
     default_cls = (args.cls_id[0] if args.cls_id else 0)
-    if args.box:
+    if args.init_boxes_file:
+        file_ann, loaded = load_init_boxes(args.init_boxes_file,
+                                           class_names)
+        if file_ann != args.ann_frame:
+            print(f"using ann_frame {file_ann} from {args.init_boxes_file} "
+                  f"(CLI --ann-frame {args.ann_frame} ignored)")
+            args.ann_frame = file_ann
+        init_boxes_with_cls = [
+            (clamp_box_xyxy(b, video_w, video_h), int(c)) for b, c in loaded]
+    elif args.box:
         raw_boxes = [clamp_box_xyxy(b, video_w, video_h)
                      for b in args.box]
         clss = resolve_box_classes(len(raw_boxes), args.cls_id,
@@ -661,6 +717,14 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
           f"{args.ann_frame}")
     if not init_boxes_with_cls:
         raise RuntimeError("no boxes to track")
+    if not 0 <= args.ann_frame < num_frames:
+        raise ValueError(f"ann_frame {args.ann_frame} out of range "
+                         f"(0..{num_frames-1})")
+    if args.ann_frame >= args.chunk_size:
+        raise ValueError(f"ann_frame {args.ann_frame} must be < "
+                         f"--chunk-size {args.chunk_size} in chunk mode")
+    save_init_boxes(os.path.join(args.output_dir, "init_boxes.json"),
+                    args.ann_frame, init_boxes_with_cls, class_names)
 
     boxes_by_frame = {}
     work_dir = os.path.join(args.output_dir, "chunk_work")
@@ -883,7 +947,15 @@ def main():
     if not names:
         raise ValueError("--classes must list at least one name")
     default_cls = (args.cls_id[0] if args.cls_id else 0)
-    if args.box:
+    if args.init_boxes_file:
+        file_ann, loaded = load_init_boxes(args.init_boxes_file, names)
+        if file_ann != args.ann_frame:
+            print(f"using ann_frame {file_ann} from {args.init_boxes_file} "
+                  f"(CLI --ann-frame {args.ann_frame} ignored)")
+            args.ann_frame = file_ann
+        boxes_with_cls = [(clamp_box_xyxy(b, video_w, video_h), int(c))
+                          for b, c in loaded]
+    elif args.box:
         raw_boxes = [clamp_box_xyxy(b, video_w, video_h)
                      for b in args.box]
         clss = resolve_box_classes(len(raw_boxes), args.cls_id, names,
@@ -898,8 +970,13 @@ def main():
                                  default_cls, args.gui_class_order)
         boxes_with_cls = [(clamp_box_xyxy(b, video_w, video_h), int(c))
                           for b, c in drawn]
+    if not 0 <= args.ann_frame < num_frames:
+        raise ValueError(f"ann_frame {args.ann_frame} out of range "
+                         f"(0..{num_frames-1})")
     print(f"tracking {len(boxes_with_cls)} object(s) from frame "
           f"{args.ann_frame}")
+    save_init_boxes(os.path.join(args.output_dir, "init_boxes.json"),
+                    args.ann_frame, boxes_with_cls, names)
     boxes, _ = split_boxes_and_clss(boxes_with_cls)
     obj_id_to_cls = {i + 1: int(c) for i, (_, c) in enumerate(boxes_with_cls)}
 
