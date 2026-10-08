@@ -136,6 +136,21 @@ python tools/box_tagger.py --video sample_dataset/videos/cafe_test.mp4 --output-
 - Overlap reuses previous chunk's last boxes as prompts; kept output drops the dup.
 - `--resume` skips finished chunks and reloads their labels for reprompting.
 
+## Multi-tag keyframes (re-tag per chunk)
+
+Single prompts drift on small objects. Tag again at chunk boundaries:
+
+```bash
+# interactive: reviews each chunk start (Enter=accept, r=redraw, s=skip, q=quit)
+python tools/box_tagger.py --video ... --chunk-size 200 --chunk-overlap 20 --resume ...
+# hands-free: load keyframes file
+python tools/box_tagger.py --video ... --chunk-size 200 --keyframes outputs/x/keyframes.json --no-interactive ...
+```
+
+- Every run saves `<output-dir>/init_boxes.json` (first prompts) and `<output-dir>/keyframes.json` (all keyframes, appended at each reviewed boundary).
+- `--keyframes` accepts legacy `init_boxes.json` as one keyframe.
+- Single-video mode also conditions on all in-range keyframes.
+
 ## Outputs
 
 ```text

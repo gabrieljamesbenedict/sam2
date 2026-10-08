@@ -106,6 +106,10 @@ def parse_args():
                    help="with --chunk-size: skip chunks whose kept labels "
                         "already exist; loads their boxes from txt for "
                         "reprompting the next chunk.")
+    p.add_argument("--review-resumed", action="store_true",
+                   help="with --resume: still prompt at each resumed chunk "
+                        "boundary (Enter=keep old labels, r=redraw and "
+                        "re-track this chunk).")
     p.add_argument("--preview", action="store_true",
                    help="show live cv2.imshow stream of tracked boxes.")
     p.add_argument("--preview-video", type=str, default=None,
@@ -142,6 +146,12 @@ def parse_args():
                         "of GUI/--box. Saved automatically to "
                         "<output-dir>/init_boxes.json on every run for "
                         "future automation.")
+    p.add_argument("--keyframes", type=str, default=None,
+                   help="multi-tag keyframes JSON "
+                        "{classes, keyframes:[{frame, boxes:[{xyxy, cls}]}]}. "
+                        "Accepts legacy init_boxes.json as one keyframe. "
+                        "Chunked mode conditions each chunk on keyframes "
+                        "inside it plus a reviewed boundary prompt.")
     p.add_argument("--bidirectional", action="store_true",
                    help="also propagate backwards from --ann-frame "
                         "(use when annotating a middle frame, e.g. HOI)")
@@ -406,6 +416,105 @@ def load_init_boxes(path, class_names):
     print(f"loaded {len(out)} init box(es) from {path} "
           f"(ann_frame {ann_frame})")
     return ann_frame, out
+
+
+def load_keyframes_file(path, class_names):
+    """Load keyframes; accepts keyframes.json or legacy init_boxes.json.
+
+    Returns (sorted [(frame, [(xyxy, cls)])], file_classes_or_None).
+    """
+    import json
+    with open(path) as fh:
+        payload = json.load(fh)
+    file_classes = payload.get("classes")
+    if file_classes and list(file_classes) != list(class_names):
+        print(f"WARNING: {path} classes {file_classes} != "
+              f"--classes {class_names}; validating ids only")
+    keyframes = []
+    if "keyframes" in payload:
+        for kf in payload["keyframes"]:
+            frame = int(kf["frame"])
+            items = []
+            for it in kf.get("boxes", []):
+                b = [float(v) for v in it["xyxy"]]
+                c = int(it["cls"])
+                if len(b) != 4:
+                    raise ValueError(f"bad xyxy {b} in {path}")
+                if not 0 <= c < len(class_names):
+                    raise ValueError(f"class id {c} in {path} out of range")
+                items.append((b, c))
+            if items:
+                keyframes.append((frame, items))
+    elif "boxes" in payload:
+        ann, items = load_init_boxes(path, class_names)
+        keyframes.append((ann, items))
+    else:
+        raise ValueError(f"unrecognized keyframes format in {path}")
+    if not keyframes:
+        raise ValueError(f"no keyframes in {path}")
+    keyframes.sort(key=lambda t: t[0])
+    print(f"loaded {len(keyframes)} keyframe(s) from {path} "
+          f"(frames {[f for f, _ in keyframes]})")
+    return keyframes, file_classes
+
+
+def save_keyframes(path, class_names, keyframes_by_frame):
+    """Write {classes, keyframes:[{frame, boxes}]} sorted by frame."""
+    import json
+    payload = {
+        "classes": list(class_names),
+        "keyframes": [
+            {"frame": int(f),
+             "boxes": [{"xyxy": [float(v) for v in b], "cls": int(c)}
+                       for b, c in boxes]}
+            for f, boxes in sorted(keyframes_by_frame.items())
+            if boxes
+        ],
+    }
+    if not payload["keyframes"]:
+        print(f"WARNING: no keyframes to save; leaving {path} untouched")
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"saved {len(payload['keyframes'])} keyframe(s) to {path}")
+
+
+def review_chunk_boundary(full_frame_dir, global_frame, auto_with_cls,
+                          class_names, default_cls, num_frames):
+    """Show overlap frame with auto boxes; accept, redraw, skip, or quit.
+
+    Returns final [(xyxy, cls)] for this boundary (clamped by caller).
+    """
+    img = read_display_frame(full_frame_dir, global_frame)
+    for (x1, y1, x2, y2), cls in auto_with_cls:
+        color = PALETTE[int(cls) % len(PALETTE)]
+        cv2.rectangle(img, (int(round(x1)), int(round(y1))),
+                      (int(round(x2)), int(round(y2))), color, 2)
+    win = f"chunk boundary frame {global_frame} (terminal: Enter=accept, r=redraw, s=skip, q=quit)"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.imshow(win, img)
+    cv2.waitKey(50)  # let the window paint before terminal blocks
+    listing = " ".join(f"{i}={n}" for i, n in enumerate(class_names))
+    while True:
+        raw = input(f"frame {global_frame} auto {len(auto_with_cls)} box(es) "
+                    f"[{listing}] -> [Enter]=accept, r=redraw, s=skip, "
+                    f"q=quit: ").strip().lower()
+        if raw in ("", "a", "accept"):
+            cv2.destroyWindow(win)
+            return list(auto_with_cls)
+        if raw in ("r", "redraw"):
+            cv2.destroyWindow(win)
+            drawn = select_boxes_gui(full_frame_dir, global_frame,
+                                     class_names, default_cls, None)
+            return drawn
+        if raw in ("s", "skip"):
+            cv2.destroyWindow(win)
+            return []
+        if raw in ("q", "quit"):
+            cv2.destroyWindow(win)
+            raise RuntimeError("stopped by user at chunk boundary")
+        print("enter empty (accept), r (redraw), s (skip), q (quit)")
 
 
 def read_display_frame(video_path, frame_idx):
@@ -685,7 +794,27 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
     if not class_names:
         raise ValueError("--classes must list at least one name")
     default_cls = (args.cls_id[0] if args.cls_id else 0)
-    if args.init_boxes_file:
+    keyframes_by_frame = {}
+    if args.keyframes:
+        kf_list, _ = load_keyframes_file(args.keyframes, class_names)
+    else:
+        kf_list = []
+    if kf_list:
+        for kf_frame, kf_boxes in kf_list:
+            if not 0 <= kf_frame < num_frames:
+                print(f"WARNING: keyframe {kf_frame} out of range "
+                      f"(0..{num_frames-1}); skipped")
+                continue
+            keyframes_by_frame[kf_frame] = [
+                (clamp_box_xyxy(b, video_w, video_h), int(c))
+                for b, c in kf_boxes]
+        first_kf = min(keyframes_by_frame)
+        if first_kf != args.ann_frame:
+            print(f"using ann_frame {first_kf} from {args.keyframes} "
+                  f"(CLI --ann-frame {args.ann_frame} ignored)")
+            args.ann_frame = first_kf
+        init_boxes_with_cls = list(keyframes_by_frame[first_kf])
+    elif args.init_boxes_file:
         file_ann, loaded = load_init_boxes(args.init_boxes_file,
                                            class_names)
         if file_ann != args.ann_frame:
@@ -725,6 +854,10 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
                          f"--chunk-size {args.chunk_size} in chunk mode")
     save_init_boxes(os.path.join(args.output_dir, "init_boxes.json"),
                     args.ann_frame, init_boxes_with_cls, class_names)
+    if args.ann_frame not in keyframes_by_frame:
+        keyframes_by_frame[args.ann_frame] = init_boxes_with_cls
+    save_keyframes(os.path.join(args.output_dir, "keyframes.json"),
+                   class_names, keyframes_by_frame)
 
     boxes_by_frame = {}
     work_dir = os.path.join(args.output_dir, "chunk_work")
@@ -734,6 +867,7 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
 
     for ki, (s, e) in enumerate(chunks):
         keep_start = s if ki == 0 else s + args.chunk_overlap
+        resume_override = None  # redrawn boundary -> re-track, don't skip
         # --- resume: kept labels already exist -> load, skip SAM ---
         if args.resume:
             missing = [g for g in range(keep_start, e)
@@ -750,7 +884,39 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
                         lines, video_w, video_h)
                 print(f"chunk {ki+1}/{len(chunks)} [{s}:{e}] resumed "
                       f"(kept {keep_start}:{e})")
-                continue
+                if (args.review_resumed and ki > 0
+                        and not args.no_interactive
+                        and s not in keyframes_by_frame):
+                    auto = get_reprompt_boxes(
+                        boxes_by_frame, s,
+                        s + args.chunk_overlap or s + 1,
+                        init_boxes_with_cls)
+                    auto = [(clamp_box_xyxy(b, video_w, video_h), int(c))
+                            for b, c in auto]
+                    reviewed = review_chunk_boundary(
+                        full_frame_dir, s, auto, class_names,
+                        default_cls, num_frames)
+                    reviewed = [
+                        (clamp_box_xyxy(b, video_w, video_h), int(c))
+                        for b, c in reviewed]
+                    if reviewed and reviewed != auto:
+                        print(f"chunk {ki+1}: boundary redrawn; "
+                              f"re-tracking [{s}:{e}]")
+                        keyframes_by_frame[s] = reviewed
+                        save_keyframes(
+                            os.path.join(args.output_dir, "keyframes.json"),
+                            class_names, keyframes_by_frame)
+                        resume_override = reviewed
+                    else:
+                        if reviewed:
+                            keyframes_by_frame[s] = reviewed
+                            save_keyframes(
+                                os.path.join(
+                                    args.output_dir, "keyframes.json"),
+                                class_names, keyframes_by_frame)
+                        continue
+                else:
+                    continue
 
         prepare_chunk_work_dir(full_frame_dir, full_basenames, s, e,
                                work_dir)
@@ -767,33 +933,94 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
                   f"{inference_state['video_height']} != "
                   f"probe {video_w}x{video_h}; using probe for YOLO")
         if ki == 0:
-            prompt_with_cls = init_boxes_with_cls
-            ann_local = args.ann_frame - s
+            boundary = [(clamp_box_xyxy(b, video_w, video_h), int(c))
+                        for b, c in init_boxes_with_cls]
+            keyframes_by_frame[s + (args.ann_frame - s)] = boundary
+            cond_global = {args.ann_frame: boundary}
+            for kf in sorted(keyframes_by_frame):
+                if s < kf < e and kf != args.ann_frame:
+                    cond_global[kf] = keyframes_by_frame[kf]
+            start_global = min(cond_global)
         else:
-            prompt_with_cls = get_reprompt_boxes(
-                boxes_by_frame, s, s + args.chunk_overlap or s + 1,
-                init_boxes_with_cls)
-            if not prompt_with_cls:
-                print(f"WARNING: chunk {ki} has no reprompt boxes; "
-                      f"reusing initial boxes (may re-acquire)")
-                prompt_with_cls = init_boxes_with_cls
-            ann_local = 0
-        prompt_boxes, _ = split_boxes_and_clss(prompt_with_cls)
+            if resume_override is not None:
+                boundary = resume_override  # reviewed during resume; recorded
+                record = False
+            else:
+                auto = get_reprompt_boxes(
+                    boxes_by_frame, s, s + args.chunk_overlap or s + 1,
+                    init_boxes_with_cls)
+                if not auto:
+                    print(f"WARNING: chunk {ki} has no reprompt boxes; "
+                          f"reusing initial boxes (may re-acquire)")
+                    auto = init_boxes_with_cls
+                auto = [(clamp_box_xyxy(b, video_w, video_h), int(c))
+                        for b, c in auto]
+                if s in keyframes_by_frame:
+                    boundary = keyframes_by_frame[s]
+                    print(f"chunk {ki+1}: using filed keyframe at {s}")
+                    record = False
+                elif args.no_interactive:
+                    boundary = auto
+                    record = False
+                else:
+                    boundary = review_chunk_boundary(
+                        full_frame_dir, s, auto, class_names, default_cls,
+                        num_frames)
+                    boundary = [
+                        (clamp_box_xyxy(b, video_w, video_h), int(c))
+                        for b, c in boundary]
+                    record = True
+            if boundary:
+                keyframes_by_frame[s] = boundary
+                cond_global = {s: boundary}
+                for kf in sorted(keyframes_by_frame):
+                    if s < kf < e:
+                        cond_global[kf] = keyframes_by_frame[kf]
+            else:
+                print(f"chunk {ki+1}: boundary skipped; "
+                      f"using interior keyframes only")
+                cond_global = {kf: keyframes_by_frame[kf]
+                               for kf in sorted(keyframes_by_frame)
+                               if s < kf < e}
+                record = False
+                if not cond_global:
+                    print(f"WARNING: chunk {ki} has no prompts; "
+                          f"falling back to auto at {s}")
+                    keyframes_by_frame[s] = auto
+                    cond_global = {s: auto}
+                    record = False
+            if record:
+                save_keyframes(
+                    os.path.join(args.output_dir, "keyframes.json"),
+                    class_names, keyframes_by_frame)
+            start_global = min(cond_global)
+        first_prompt = cond_global[min(cond_global)]
         obj_id_to_cls = {i + 1: int(c)
-                         for i, (_, c) in enumerate(prompt_with_cls)}
+                         for i, (_, c) in enumerate(first_prompt)}
+        for kf in sorted(cond_global):
+            _, kc = split_boxes_and_clss(cond_global[kf])
+            if len(kc) != len(first_prompt):
+                print(f"WARNING: keyframe {kf} has {len(kc)} boxes vs "
+                      f"{len(first_prompt)} at {min(cond_global)}; "
+                      f"aligning by order")
+                for i, c in enumerate(kc):
+                    obj_id_to_cls[i + 1] = int(c)
         print(f"chunk {ki+1}/{len(chunks)} [{s}:{e}] "
-              f"prompt {len(prompt_boxes)} box(es) at local {ann_local} "
-              f"(global {s + ann_local}) ...")
+              f"{len(cond_global)} cond frame(s) "
+              f"{sorted(cond_global)} ...")
         with autocast:
-            for obj_idx, box in enumerate(prompt_boxes):
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=int(ann_local),
-                    obj_id=obj_idx + 1,
-                    box=np.array(box, dtype=np.float32),
-                )
+            for kf in sorted(cond_global):
+                local = int(kf - s)
+                kf_boxes, _ = split_boxes_and_clss(cond_global[kf])
+                for obj_idx, box in enumerate(kf_boxes):
+                    predictor.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=local,
+                        obj_id=obj_idx + 1,
+                        box=np.array(box, dtype=np.float32),
+                    )
             for f_local, obj_ids, m in predictor.propagate_in_video(
-                inference_state, start_frame_idx=int(ann_local),
+                inference_state, start_frame_idx=int(start_global - s),
                 reverse=False,
             ):
                 g = s + int(f_local)
@@ -818,6 +1045,8 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
         del inference_state
         if device == "cuda" and _torch.cuda.is_available():
             _torch.cuda.empty_cache()
+    save_keyframes(os.path.join(args.output_dir, "keyframes.json"),
+                   class_names, keyframes_by_frame)
     # Cleanup scratch JPEGs (labels already written).
     if os.path.isdir(work_dir):
         clear_jpeg_dir(work_dir)
@@ -947,7 +1176,25 @@ def main():
     if not names:
         raise ValueError("--classes must list at least one name")
     default_cls = (args.cls_id[0] if args.cls_id else 0)
-    if args.init_boxes_file:
+    keyframes_by_frame = {}
+    if args.keyframes:
+        kf_list, _ = load_keyframes_file(args.keyframes, names)
+        for kf_frame, kf_boxes in kf_list:
+            if not 0 <= kf_frame < num_frames:
+                print(f"WARNING: keyframe {kf_frame} out of range; skipped")
+                continue
+            keyframes_by_frame[kf_frame] = [
+                (clamp_box_xyxy(b, video_w, video_h), int(c))
+                for b, c in kf_boxes]
+        if not keyframes_by_frame:
+            raise ValueError(f"no in-range keyframes in {args.keyframes}")
+        first_kf = min(keyframes_by_frame)
+        if first_kf != args.ann_frame:
+            print(f"using ann_frame {first_kf} from {args.keyframes} "
+                  f"(CLI --ann-frame {args.ann_frame} ignored)")
+            args.ann_frame = first_kf
+        boxes_with_cls = list(keyframes_by_frame[first_kf])
+    elif args.init_boxes_file:
         file_ann, loaded = load_init_boxes(args.init_boxes_file, names)
         if file_ann != args.ann_frame:
             print(f"using ann_frame {file_ann} from {args.init_boxes_file} "
@@ -977,6 +1224,12 @@ def main():
           f"{args.ann_frame}")
     save_init_boxes(os.path.join(args.output_dir, "init_boxes.json"),
                     args.ann_frame, boxes_with_cls, names)
+    if keyframes_by_frame:
+        save_keyframes(os.path.join(args.output_dir, "keyframes.json"),
+                       names, keyframes_by_frame)
+    else:
+        save_keyframes(os.path.join(args.output_dir, "keyframes.json"),
+                       names, {args.ann_frame: boxes_with_cls})
     boxes, _ = split_boxes_and_clss(boxes_with_cls)
     obj_id_to_cls = {i + 1: int(c) for i, (_, c) in enumerate(boxes_with_cls)}
 
@@ -986,6 +1239,11 @@ def main():
     # discard the full logits, so memory stays O(frames x boxes).
     boxes_by_frame = {}
     with autocast:
+        extra_kfs = sorted(f for f in keyframes_by_frame
+                           if f != args.ann_frame)
+        if extra_kfs:
+            print(f"conditioning on {1 + len(extra_kfs)} keyframe(s): "
+                  f"{[args.ann_frame] + extra_kfs}")
         for obj_idx, box in enumerate(boxes):
             obj_id = obj_idx + 1  # SAM2 obj ids are 1-based here
             predictor.add_new_points_or_box(
@@ -994,6 +1252,18 @@ def main():
                 obj_id=obj_id,
                 box=np.array(box, dtype=np.float32),
             )
+        for kf in extra_kfs:
+            kf_boxes, kf_clss = split_boxes_and_clss(keyframes_by_frame[kf])
+            if len(kf_boxes) != len(boxes):
+                print(f"WARNING: keyframe {kf} has {len(kf_boxes)} boxes vs "
+                      f"{len(boxes)} at {args.ann_frame}; aligning by order")
+            for obj_idx, box in enumerate(kf_boxes):
+                predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=int(kf),
+                    obj_id=obj_idx + 1,
+                    box=np.array(box, dtype=np.float32),
+                )
 
         # Two passes when bidirectional (ann-frame in both; keep first).
         passes = [(args.ann_frame, False)]

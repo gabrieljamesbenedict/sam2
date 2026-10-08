@@ -65,7 +65,12 @@ Overlap frames between chunks. First chunk keeps all, later chunks drop the over
 ```python
 --resume  # store_true, use with --chunk-size
 ```
-Skip chunks whose kept `labels/*.txt` already exist; loads them back for reprompting the next chunk. Crash-safe reruns.
+Skip chunks whose kept `labels/*.txt` already exist; loads them back for reprompting the next chunk. Crash-safe reruns. Note: fully-resumed chunks skip SAM and boundary review — drop `--resume` (or delete the confused range's txt files) to force re-tracking with review.
+
+```python
+--review-resumed  # store_true, use with --resume
+```
+Still prompt at each resumed chunk boundary (`Enter`=keep old labels, `r`=redraw and re-track this chunk).
 
 ## Annotation
 
@@ -98,6 +103,11 @@ Pre-declared class per drawn GUI box in order (no prompts). Omit for terminal pr
 --init-boxes-file PATH  # default None, e.g. outputs/x/init_boxes.json
 ```
 Load initial `(box, cls)` prompts from JSON instead of GUI/`--box`. Saved automatically to `<output-dir>/init_boxes.json` on every run for future automation. File `ann_frame` overrides CLI.
+
+```python
+--keyframes PATH  # default None, e.g. outputs/x/keyframes.json
+```
+Multi-tag keyframes `{classes, keyframes:[{frame, boxes:[{xyxy, cls}]}]`. Accepts legacy `init_boxes.json` as one keyframe. Single mode conditions on all in-range keyframes; chunked mode conditions each chunk on keyframes inside it plus a boundary prompt (interactive review: Enter=accept, r=redraw, s=skip, q=quit; `--no-interactive` auto-accepts). Saved to `<output-dir>/keyframes.json`.
 
 ```python
 --no-interactive  # store_true
