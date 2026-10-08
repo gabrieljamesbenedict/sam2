@@ -152,6 +152,13 @@ def parse_args():
                         "Accepts legacy init_boxes.json as one keyframe. "
                         "Chunked mode conditions each chunk on keyframes "
                         "inside it plus a reviewed boundary prompt.")
+    p.add_argument("--review-size", type=int, nargs=2, default=[800, 600],
+                   metavar=("W", "H"),
+                   help="display size for GUI windows (default 800 600). "
+                        "Display-only; saved boxes stay full-res.")
+    p.add_argument("--no-review-preview", action="store_true",
+                   help="boundary review without image window "
+                        "(terminal prompt only).")
     p.add_argument("--bidirectional", action="store_true",
                    help="also propagate backwards from --ann-frame "
                         "(use when annotating a middle frame, e.g. HOI)")
@@ -481,40 +488,63 @@ def save_keyframes(path, class_names, keyframes_by_frame):
 
 
 def review_chunk_boundary(full_frame_dir, global_frame, auto_with_cls,
-                          class_names, default_cls, num_frames):
+                          class_names, default_cls, num_frames,
+                          review_size=None, no_preview=False):
     """Show overlap frame with auto boxes; accept, redraw, skip, or quit.
 
+    In-window keys (pumped waitKey loop, never blocks the message pump):
+    Enter/Space=accept, r=redraw via GUI, s=skip, q/ESC=quit.
+    With no_preview, falls back to a terminal prompt (no image window).
     Returns final [(xyxy, cls)] for this boundary (clamped by caller).
     """
-    img = read_display_frame(full_frame_dir, global_frame)
-    for (x1, y1, x2, y2), cls in auto_with_cls:
-        color = PALETTE[int(cls) % len(PALETTE)]
-        cv2.rectangle(img, (int(round(x1)), int(round(y1))),
-                      (int(round(x2)), int(round(y2))), color, 2)
-    win = f"chunk boundary frame {global_frame} (terminal: Enter=accept, r=redraw, s=skip, q=quit)"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.imshow(win, img)
-    cv2.waitKey(50)  # let the window paint before terminal blocks
+    auto_with_cls = list(auto_with_cls)
     listing = " ".join(f"{i}={n}" for i, n in enumerate(class_names))
-    while True:
-        raw = input(f"frame {global_frame} auto {len(auto_with_cls)} box(es) "
-                    f"[{listing}] -> [Enter]=accept, r=redraw, s=skip, "
-                    f"q=quit: ").strip().lower()
-        if raw in ("", "a", "accept"):
+    if no_preview:
+        print(f"frame {global_frame} auto {len(auto_with_cls)} box(es) "
+              f"[{listing}]")
+        while True:
+            raw = input("[Enter]=accept, r=redraw, s=skip, q=quit: "
+                        ).strip().lower()
+            if raw in ("", "a", "accept"):
+                return auto_with_cls
+            if raw in ("r", "redraw"):
+                return select_boxes_gui(
+                    full_frame_dir, global_frame, class_names,
+                    default_cls, None, review_size)
+            if raw in ("s", "skip"):
+                return []
+            if raw in ("q", "quit"):
+                raise RuntimeError("stopped by user at chunk boundary")
+            print("enter empty (accept), r (redraw), s (skip), q (quit)")
+    img = read_display_frame(full_frame_dir, global_frame)
+    draw_boxes_on_img(img, auto_with_cls, class_names)
+    win = (f"boundary {global_frame} auto={len(auto_with_cls)} "
+           f"[Enter=accept r=redraw s=skip q=quit]")
+    print(f"frame {global_frame} auto {len(auto_with_cls)} box(es) "
+          f"[{listing}] -> keys in image window: Enter=accept, r=redraw, "
+          f"s=skip, q=quit")
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    apply_window_size(win, review_size)
+    try:
+        while True:
+            cv2.imshow(win, img)
+            k = cv2.waitKey(50) & 0xFF
+            if k in (13, 32):  # Enter / Space
+                return auto_with_cls
+            if k in (ord("r"), ord("R")):
+                cv2.destroyWindow(win)
+                return select_boxes_gui(
+                    full_frame_dir, global_frame, class_names,
+                    default_cls, None, review_size)
+            if k in (ord("s"), ord("S")):
+                return []
+            if k in (27, ord("q"), ord("Q")):
+                raise RuntimeError("stopped by user at chunk boundary")
+    finally:
+        try:
             cv2.destroyWindow(win)
-            return list(auto_with_cls)
-        if raw in ("r", "redraw"):
-            cv2.destroyWindow(win)
-            drawn = select_boxes_gui(full_frame_dir, global_frame,
-                                     class_names, default_cls, None)
-            return drawn
-        if raw in ("s", "skip"):
-            cv2.destroyWindow(win)
-            return []
-        if raw in ("q", "quit"):
-            cv2.destroyWindow(win)
-            raise RuntimeError("stopped by user at chunk boundary")
-        print("enter empty (accept), r (redraw), s (skip), q (quit)")
+        except Exception:
+            pass
 
 
 def read_display_frame(video_path, frame_idx):
@@ -542,13 +572,14 @@ def read_display_frame(video_path, frame_idx):
 
 
 def select_boxes_gui(video_path, frame_idx, class_names=None,
-                     default_cls=0, gui_class_order=None):
+                     default_cls=0, gui_class_order=None, win_size=None):
     """Draw boxes, return [(xyxy, cls)] using prompts or pre-declared order."""
     img = read_display_frame(video_path, frame_idx)
     class_names = class_names or ["object"]
     boxes = []
     win = "box_tagger: drag box, ENTER=keep, ESC=done"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    apply_window_size(win, win_size)
     while True:
         # selectROI blocks until ENTER/ESC; zero-area = finished/cancelled
         x, y, w, h = cv2.selectROI(win, img, showCrosshair=True)
@@ -687,9 +718,43 @@ PALETTE = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (0, 255, 255),
            (255, 0, 255), (255, 255, 0)]
 
 
+def apply_window_size(win, review_size):
+    """Resize a WINDOW_NORMAL window; display-only, boxes stay full-res."""
+    if not review_size:
+        return
+    try:
+        w, h = int(review_size[0]), int(review_size[1])
+        if w > 0 and h > 0:
+            cv2.resizeWindow(win, w, h)
+    except Exception:
+        pass
+
+
+def draw_boxes_on_img(img, boxes_with_cls, class_names=None):
+    """Draw [(xyxy, cls)] in place with per-class colors + labels."""
+    for oi, item in enumerate(boxes_with_cls):
+        if (isinstance(item, (list, tuple)) and len(item) == 2
+                and isinstance(item[0], (list, tuple))):
+            (x1, y1, x2, y2), cls = item
+            cls = int(cls)
+        else:
+            x1, y1, x2, y2 = item
+            cls = 0
+        color = PALETTE[cls % len(PALETTE)]
+        cv2.rectangle(img, (int(round(x1)), int(round(y1))),
+                      (int(round(x2)), int(round(y2))), color, 2)
+        if class_names and 0 <= cls < len(class_names):
+            tag = f"{class_names[cls]} {oi + 1}"
+        else:
+            tag = f"cls{cls} obj{oi + 1}"
+        cv2.putText(img, tag, (int(round(x1)), max(0, int(round(y1)) - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    return img
+
+
 def render_preview_stream(frame_dir, basenames, boxes_by_frame, video_w,
                           video_h, fps, show_live, save_path,
-                          class_names=None):
+                          class_names=None, win_size=None):
     """Stream annotated frames: live cv2.imshow and/or saved mp4.
 
     boxes_by_frame values are [(xyxy, cls)] (multi-class) or legacy [xyxy].
@@ -708,6 +773,7 @@ def render_preview_stream(frame_dir, basenames, boxes_by_frame, video_w,
     if show_live:
         cv2.namedWindow("box_tagger preview (q/ESC to quit)",
                         cv2.WINDOW_NORMAL)
+        apply_window_size("box_tagger preview (q/ESC to quit)", win_size)
     delay = max(1, int(round(1000.0 / fps))) if fps and fps > 0 else 30
     ext_cache = {}
     try:
@@ -727,24 +793,7 @@ def render_preview_stream(frame_dir, basenames, boxes_by_frame, video_w,
                 continue
             if img.shape[1] != video_w or img.shape[0] != video_h:
                 img = cv2.resize(img, (video_w, video_h))
-            for oi, item in enumerate(boxes_by_frame.get(f, [])):
-                if (isinstance(item, (list, tuple)) and len(item) == 2
-                        and isinstance(item[0], (list, tuple))):
-                    (x1, y1, x2, y2), cls = item
-                    cls = int(cls)
-                else:
-                    x1, y1, x2, y2 = item
-                    cls = 0
-                color = PALETTE[cls % len(PALETTE)]
-                cv2.rectangle(img, (int(round(x1)), int(round(y1))),
-                              (int(round(x2)), int(round(y2))), color, 2)
-                if class_names and 0 <= cls < len(class_names):
-                    tag = f"{class_names[cls]} {oi + 1}"
-                else:
-                    tag = f"cls{cls} obj{oi + 1}"
-                cv2.putText(img, tag, (int(round(x1)),
-                              max(0, int(round(y1)) - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            draw_boxes_on_img(img, boxes_by_frame.get(f, []), class_names)
             if writer is not None:
                 writer.write(img)
             if show_live:
@@ -836,7 +885,7 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
               f"(ENTER keeps, ESC finishes)")
         drawn = select_boxes_gui(full_frame_dir, args.ann_frame,
                                  class_names, default_cls,
-                                 args.gui_class_order)
+                                 args.gui_class_order, args.review_size)
         init_boxes_with_cls = [
             (clamp_box_xyxy(b, video_w, video_h), int(c)) for b, c in drawn]
         for _, c in init_boxes_with_cls:
@@ -895,7 +944,8 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
                             for b, c in auto]
                     reviewed = review_chunk_boundary(
                         full_frame_dir, s, auto, class_names,
-                        default_cls, num_frames)
+                        default_cls, num_frames, args.review_size,
+                        args.no_review_preview)
                     reviewed = [
                         (clamp_box_xyxy(b, video_w, video_h), int(c))
                         for b, c in reviewed]
@@ -965,7 +1015,8 @@ def run_chunked(args, predictor, full_frame_dir, full_basenames, preview_fps,
                 else:
                     boundary = review_chunk_boundary(
                         full_frame_dir, s, auto, class_names, default_cls,
-                        num_frames)
+                        num_frames, args.review_size,
+                        args.no_review_preview)
                     boundary = [
                         (clamp_box_xyxy(b, video_w, video_h), int(c))
                         for b, c in boundary]
@@ -1153,7 +1204,8 @@ def main():
                                   float(preview_fps if preview_fps else 30.0),
                                   show_live=bool(args.preview),
                                   save_path=args.preview_video,
-                                  class_names=class_names)
+                                  class_names=class_names,
+                                  win_size=args.review_size)
         print("done")
         return
 
@@ -1214,7 +1266,8 @@ def main():
         print(f"draw box(es) on frame {args.ann_frame} "
               f"(ENTER keeps, ESC finishes)")
         drawn = select_boxes_gui(sam2_path, args.ann_frame, names,
-                                 default_cls, args.gui_class_order)
+                                 default_cls, args.gui_class_order,
+                                 args.review_size)
         boxes_with_cls = [(clamp_box_xyxy(b, video_w, video_h), int(c))
                           for b, c in drawn]
     if not 0 <= args.ann_frame < num_frames:
@@ -1335,7 +1388,8 @@ def main():
                               float(preview_fps),
                               show_live=bool(args.preview),
                               save_path=args.preview_video,
-                              class_names=names)
+                              class_names=names,
+                              win_size=args.review_size)
 
     print("done")
 

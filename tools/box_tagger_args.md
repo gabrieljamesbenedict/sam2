@@ -72,6 +72,21 @@ Skip chunks whose kept `labels/*.txt` already exist; loads them back for repromp
 ```
 Still prompt at each resumed chunk boundary (`Enter`=keep old labels, `r`=redraw and re-track this chunk).
 
+```python
+--review-size W H  # default 800 600
+```
+Display size for GUI windows (draw, boundary review, live preview). Display-only; saved boxes stay full-res.
+
+```python
+--no-review-preview  # store_true
+```
+Boundary review without image window (terminal prompt only). Use if OpenCV windows misbehave.
+
+```python
+--review-resumed  # store_true, use with --resume
+```
+Still prompt at each resumed chunk boundary (`Enter`=keep old labels, `r`=redraw and re-track this chunk).
+
 ## Annotation
 
 ```python
