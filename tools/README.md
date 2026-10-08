@@ -34,3 +34,32 @@ python ./tools/vos_inference.py \
 Then, we can use the evaluation tools or servers for each dataset to get the performance of the prediction PNG files above.
 
 Note: by default, the `vos_inference.py` script above assumes that all objects to track already appear on frame 0 in each video (as is the case in DAVIS, MOSE or SA-V). **For VOS datasets that don't have all objects to track appearing in the first frame (such as LVOS or YouTube-VOS), please add the `--track_object_appearing_later_in_video` flag when using `vos_inference.py`**.
+
+### Draw-once video box tagging -> YOLO
+
+The `box_tagger.py` script draws box(es) on a single frame, tracks them with SAM 2 through the whole video, and exports per-frame boxes in YOLO txt format (one `.txt` per frame; empty file = no detection). All boxes share one class id (default `0 = person`).
+
+Interactive (draw with mouse on frame 0):
+```bash
+python ./tools/box_tagger.py \
+  --video notebooks/videos/bedroom.mp4 \
+  --output-dir ./outputs/bedroom_boxes
+```
+
+Non-interactive (box in original video pixels, `x1 y1 x2 y2`; repeat `--box` per object):
+```bash
+python ./tools/box_tagger.py \
+  --video notebooks/videos/bedroom.mp4 \
+  --output-dir ./outputs/bedroom_boxes \
+  --box 100 200 400 500 --ann-frame 0 --no-interactive
+```
+
+Annotate a middle frame and track both directions (recommended when the clearest view is mid-video, e.g. HOI):
+```bash
+python ./tools/box_tagger.py \
+  --video myvideo.mp4 \
+  --output-dir ./outputs/myvideo_boxes \
+  --box 100 200 400 500 --ann-frame 50 --bidirectional --no-interactive
+```
+
+Output: `<output-dir>/labels/<frame>.txt` (`cls cx cy w h` normalized), `<output-dir>/data.yaml`, and `<output-dir>/images/` when `--save-images` is passed. Use `--sam2_cfg` / `--sam2_checkpoint` to switch model size (default small for speed).
