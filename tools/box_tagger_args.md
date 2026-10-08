@@ -122,7 +122,13 @@ Load initial `(box, cls)` prompts from JSON instead of GUI/`--box`. Saved automa
 ```python
 --keyframes PATH  # default None, e.g. outputs/x/keyframes.json
 ```
-Multi-tag keyframes `{classes, keyframes:[{frame, boxes:[{xyxy, cls}]}]`. Accepts legacy `init_boxes.json` as one keyframe. Single mode conditions on all in-range keyframes; chunked mode conditions each chunk on keyframes inside it plus a boundary prompt (interactive review: Enter=accept, r=redraw, s=skip, q=quit; `--no-interactive` auto-accepts). Saved to `<output-dir>/keyframes.json`.
+Multi-tag keyframes `{classes, keyframes:[{frame, boxes:[{xyxy, cls}]}]`. Accepts legacy `init_boxes.json` as one keyframe. Single mode conditions on all in-range keyframes; chunked mode conditions each chunk on keyframes inside it plus a boundary prompt. Review keys: `Enter` accept, `a` add boxes, `r` redraw all, `e` edit one, `1-9`/`d` delete, `s` skip, `q` quit. Saved to `<output-dir>/keyframes.json`.
+
+After fixing labels in CVAT/Label Studio, rebuild keyframes without re-tracking:
+
+```bash
+python tools/labels_to_keyframes.py --labels-dir outputs/x/labels --classes phone,laptop --probe-image sample_dataset/image_sequence/00000.jpg --output outputs/x/keyframes.json
+```
 
 ```python
 --no-interactive  # store_true

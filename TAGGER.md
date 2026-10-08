@@ -150,6 +150,13 @@ python tools/box_tagger.py --video ... --chunk-size 200 --keyframes outputs/x/ke
 - Every run saves `<output-dir>/init_boxes.json` (first prompts) and `<output-dir>/keyframes.json` (all keyframes, appended at each reviewed boundary).
 - `--keyframes` accepts legacy `init_boxes.json` as one keyframe.
 - Single-video mode also conditions on all in-range keyframes.
+- Boundary keys: `Enter` accept, `a` add boxes, `r` redraw all, `e` edit one (then number), `1-9`/`d` delete, `s` skip, `q` quit.
+- Draw GUI paints kept boxes while drawing; class comes from an in-GUI chip picker (click or `0-9a-z`, `Enter`=default).
+- Fix labels externally (CVAT/Label Studio over `labels/`), then rebuild keyframes without re-tracking:
+
+```bash
+python tools/labels_to_keyframes.py --labels-dir outputs/cafe_test_boxes/labels --classes phone,laptop,wallet,bottle,bag,cup --probe-image sample_dataset/image_sequence/00000.jpg --output outputs/cafe_test_boxes/keyframes.json
+```
 
 ## Outputs
 

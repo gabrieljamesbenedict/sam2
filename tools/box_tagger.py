@@ -516,29 +516,83 @@ def review_chunk_boundary(full_frame_dir, global_frame, auto_with_cls,
             if raw in ("q", "quit"):
                 raise RuntimeError("stopped by user at chunk boundary")
             print("enter empty (accept), r (redraw), s (skip), q (quit)")
-    img = read_display_frame(full_frame_dir, global_frame)
-    draw_boxes_on_img(img, auto_with_cls, class_names)
-    win = (f"boundary {global_frame} auto={len(auto_with_cls)} "
-           f"[Enter=accept r=redraw s=skip q=quit]")
+    base = read_display_frame(full_frame_dir, global_frame)
+    current = list(auto_with_cls)
+    win = (f"boundary {global_frame} "
+           f"[Enter=accept a=add r=redraw e=edit 1-9/d=delete s=skip q=quit]")
     print(f"frame {global_frame} auto {len(auto_with_cls)} box(es) "
-          f"[{listing}] -> keys in image window: Enter=accept, r=redraw, "
-          f"s=skip, q=quit")
+          f"[{listing}] -> keys in image window: Enter=accept, a=add, "
+          f"r=redraw-all, e=edit-one, 1-9/d=delete, s=skip, q=quit")
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     apply_window_size(win, review_size)
+    edit_mode = False
     try:
         while True:
-            cv2.imshow(win, img)
-            k = cv2.waitKey(50) & 0xFF
+            show = base.copy()
+            draw_boxes_on_img(show, current, class_names)
+            if edit_mode:
+                cv2.putText(show, "EDIT: press box number 1-9",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                            (0, 255, 255), 2)
+            cv2.imshow(win, show)
+            k = cv2.waitKey(80) & 0xFF
+            if edit_mode:
+                if ord("1") <= k <= ord("9"):
+                    i = k - ord("1")
+                    if 0 <= i < len(current):
+                        old_cls = int(current[i][1])
+                        cv2.destroyWindow(win)
+                        x, y, w, h = cv2.selectROI(
+                            "edit box (ENTER=keep, ESC=cancel)", base,
+                            showCrosshair=True)
+                        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+                        apply_window_size(win, review_size)
+                        if w > 0 and h > 0:
+                            current[i] = ([float(x), float(y),
+                                           float(x + w), float(y + h)],
+                                          old_cls)
+                            print(f"edited box {i + 1}")
+                    edit_mode = False
+                elif k in (27,):
+                    edit_mode = False
+                continue
             if k in (13, 32):  # Enter / Space
-                return auto_with_cls
-            if k in (ord("r"), ord("R")):
+                return current
+            if k in (ord("a"), ord("A")):
                 cv2.destroyWindow(win)
-                return select_boxes_gui(
+                newbies = select_boxes_gui(
                     full_frame_dir, global_frame, class_names,
                     default_cls, None, review_size)
-            if k in (ord("s"), ord("S")):
+                current.extend(newbies)
+                print(f"added {len(newbies)} box(es), "
+                      f"{len(current)} total")
+                cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+                apply_window_size(win, review_size)
+            elif k in (ord("r"), ord("R")):
+                cv2.destroyWindow(win)
+                current = select_boxes_gui(
+                    full_frame_dir, global_frame, class_names,
+                    default_cls, None, review_size)
+                print(f"redrew all: {len(current)} box(es)")
+                cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+                apply_window_size(win, review_size)
+            elif k in (ord("e"), ord("E")):
+                if current:
+                    edit_mode = True
+            elif k in (ord("d"), ord("D")):
+                if current:
+                    dropped = current.pop()
+                    print(f"dropped last box (cls {dropped[1]}), "
+                          f"{len(current)} left (1-9 drops by number)")
+            elif ord("1") <= k <= ord("9"):
+                i = k - ord("1")
+                if 0 <= i < len(current):
+                    dropped = current.pop(i)
+                    print(f"dropped box {i + 1} (cls {dropped[1]}), "
+                          f"{len(current)} left")
+            elif k in (ord("s"), ord("S")):
                 return []
-            if k in (27, ord("q"), ord("Q")):
+            elif k in (27, ord("q"), ord("Q")):
                 raise RuntimeError("stopped by user at chunk boundary")
     finally:
         try:
@@ -571,18 +625,89 @@ def read_display_frame(video_path, frame_idx):
     return img
 
 
+def pick_class_gui(class_names, default_cls=0):
+    """Clickable class-chip picker; returns cls id.
+
+    Click a chip, press 0-9/a-z, Enter=default. Fixed-size canvas so
+    click coordinates need no rescaling.
+    """
+    import numpy as np
+    n = len(class_names)
+    row_h, pad, header = 44, 10, 34
+    W = 320
+    H = header + n * row_h + pad * 2
+    canvas = np.full((H, W, 3), 30, dtype=np.uint8)
+    cv2.putText(canvas, f"class? Enter={default_cls}", (pad, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    rows = []
+    for i, name in enumerate(class_names):
+        y0 = header + pad + i * row_h
+        color = PALETTE[i % len(PALETTE)]
+        cv2.rectangle(canvas, (pad, y0), (W - pad, y0 + row_h - 8),
+                      color, -1)
+        key = str(i) if i < 10 else chr(ord("a") + i - 10)
+        cv2.putText(canvas, f"{key}: {name}", (pad + 8, y0 + 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        rows.append((y0, y0 + row_h - 8))
+    win = "pick class (click / 0-9a-z / Enter)"
+    cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
+    clicks = []
+
+    def _on_mouse(event, x, y, _flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            clicks.append((x, y))
+
+    cv2.setMouseCallback(win, _on_mouse)
+    try:
+        while True:
+            cv2.imshow(win, canvas)
+            k = cv2.waitKey(60) & 0xFF
+            for (x, y) in clicks:
+                for i, (y0, y1) in enumerate(rows):
+                    if y0 <= y <= y1 and pad <= x <= W - pad:
+                        return i
+                clicks.clear()
+            if k in (13, 32):  # Enter / Space
+                return int(default_cls)
+            if ord("0") <= k <= ord("9"):
+                v = k - ord("0")
+                if v < n:
+                    return v
+            if ord("a") <= k <= ord("z"):
+                v = 10 + k - ord("a")
+                if v < n:
+                    return v
+    finally:
+        try:
+            cv2.destroyWindow(win)
+        except Exception:
+            pass
+
+
 def select_boxes_gui(video_path, frame_idx, class_names=None,
                      default_cls=0, gui_class_order=None, win_size=None):
-    """Draw boxes, return [(xyxy, cls)] using prompts or pre-declared order."""
-    img = read_display_frame(video_path, frame_idx)
+    """Draw boxes, return [(xyxy, cls)] using prompts or pre-declared order.
+
+    Previously kept boxes stay painted while drawing the next one.
+    Class comes from --gui-class-order, else an in-GUI chip picker
+    (terminal prompt fallback when no display is available).
+    """
+    base = read_display_frame(video_path, frame_idx)
     class_names = class_names or ["object"]
     boxes = []
     win = "box_tagger: drag box, ENTER=keep, ESC=done"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     apply_window_size(win, win_size)
     while True:
+        # Show previously kept boxes under the next rubber-band.
+        show = base.copy()
+        if boxes:
+            draw_boxes_on_img(show, boxes, class_names)
+            cv2.imshow(win, show)
+            cv2.waitKey(30)
         # selectROI blocks until ENTER/ESC; zero-area = finished/cancelled
-        x, y, w, h = cv2.selectROI(win, img, showCrosshair=True)
+        x, y, w, h = cv2.selectROI(win, show if boxes else base,
+                                   showCrosshair=True)
         if w <= 0 or h <= 0:
             break
         box = [float(x), float(y), float(x + w), float(y + h)]
@@ -598,12 +723,15 @@ def select_boxes_gui(video_path, frame_idx, class_names=None,
                 cv2.destroyWindow(win)
                 raise ValueError(f"gui class {cls} out of range")
         else:
-            # Prompt in terminal (window stays open for next draw).
             listing = " ".join(f"{i}={n}"
                                for i, n in enumerate(class_names))
-            print(f"kept box {idx}: {[x, y, x + w, y + h]} "
-                  f"(draw another, or ESC to finish)")
-            cls = prompt_class_for_box(idx, class_names, default_cls)
+            print(f"kept box {idx}: {[x, y, x + w, y + h]} -> pick class "
+                  f"[{listing}]")
+            try:
+                cls = pick_class_gui(class_names, default_cls)
+            except Exception as e:
+                print(f"GUI picker unavailable ({e}); terminal fallback")
+                cls = prompt_class_for_box(idx, class_names, default_cls)
         boxes.append((box, cls))
     cv2.destroyWindow(win)
     if not boxes:
