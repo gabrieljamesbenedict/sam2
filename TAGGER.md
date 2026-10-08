@@ -7,12 +7,28 @@ Script: `tools/box_tagger.py`. Full flag reference: `tools/box_tagger_args.md`.
 
 ## Setup
 
+Prerequisites: Python ≥3.10, matching torch/torchvision/CUDA.
+Windows native is fragile — WSL Ubuntu recommended (per INSTALL.md).
+
 ```bash
 python -m venv .venv
+# Windows:
 .venv\Scripts\activate
+# Linux/WSL:
+source .venv/bin/activate
+```
+
+```bash
+# 1. torch first (match your CUDA; example cu121):
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install opencv-python numpy hydra-core iopath
-pip install git+https://github.com/facebookresearch/sam2.git
+
+# 2. this repo (registers sam2 + configs; skip CUDA ext on laptops):
+SAM2_BUILD_CUDA=0 pip install -e .
+# Windows cmd (no VAR=... prefix):
+#   set SAM2_BUILD_CUDA=0 && pip install -e .
+
+# 3. tagger-only extras (not in base install_requires):
+pip install opencv-python pillow tqdm
 ```
 
 Checkpoints are not committed. Place `.pt` under `checkpoints/`:
@@ -21,6 +37,14 @@ Checkpoints are not committed. Place `.pt` under `checkpoints/`:
 checkpoints/sam2.1_hiera_tiny.pt
 checkpoints/sam2.1_hiera_small.pt
 ```
+
+Notes:
+
+- Base install covers `hydra-core/iopath/numpy/tqdm/pillow`.
+  Skip `.[notebooks]` / demo / dev extras — JPEG-dir path needs no `decord`/Flask.
+- Without step 2 you hit `MissingConfigException` / `cannot import _C`.
+- CUDA ext build failure is non-fatal (hole-filling skipped).
+- Run from repo root so `configs/sam2.1/...` resolves.
 
 ## How it works
 
